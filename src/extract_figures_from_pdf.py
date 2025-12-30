@@ -122,8 +122,20 @@ AL2024_TASKS = [
     }
 ]
 
+# Al2219材料提取任务
+AL2219_TASKS = [
+    {
+        "name": "Al2219 Figure 3",
+        "pdf_path": os.path.join(DATA_DIR, "Al2219", "metals-11-00077.pdf"),
+        "keyword": "Figure 3",
+        "page_range": (1, 15),
+        "description": "Al2219应力应变曲线",
+        "output_prefix": "al2219_fig3"
+    }
+]
+
 # 合并所有任务
-ALL_EXTRACTION_TASKS = AL7075_TASKS + AL2024_TASKS
+ALL_EXTRACTION_TASKS = AL7075_TASKS + AL2024_TASKS + AL2219_TASKS
 
 # ========== 核心功能函数 ==========
 
