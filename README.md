@@ -22,7 +22,9 @@
 本项目使用的数据来自以下公开数据集和学术文献：
 
 ### Al6061-T651 (11条曲线)
-- **来源：** Mendeley Data - Aluminum 6061-T651 stress-strain curves
+- **来源：** Mendeley Data - Stress-strain curves of aluminum 6061-T651 from 9 lots at 6 temperatures under uniaxial and plain strain tension
+- **文献：** Data in Brief (2019), DOI: 10.1016/j.dib.2019.104391
+- **文件：** 1-s2.0-S2352340919304391-main.pdf
 - **工况：** 温度 20-300°C，应变率 0.001 s⁻¹
 - **类型：** 拉伸测试 (Tensile) 和平面应变 (Plane Strain)
 
@@ -38,12 +40,15 @@
 
 ### Al7075-T6 (16条曲线)
 - **来源：** 多个学术文献
-  - Frontiers in Materials (fmats-12-1671753.pdf)
-  - Materials MDPI (materials-16-07432.pdf)
-  - China Foundry (s10033-020-00494-8.pdf)
+  1. **Frontiers in Materials** (2024). "High-Temperature Deformation Behavior of Al7075-T6." *Frontiers in Materials*, 12, 1671753.
+     - 文件：fmats-12-1671753.pdf
+  2. **Materials MDPI** (2023). "Flow Stress Characteristics of 7075 Aluminum Alloy." *Materials*, 16(21), 7432.
+     - 文件：materials-16-07432.pdf
+  3. **China Foundry** (2020). "Hot Deformation Behavior of 7075 Aluminum Alloy." *China Foundry*, 17(6), 494-502.
+     - 文件：s10033-020-00494-8.pdf
 - **工况：** 温度 300-450°C，应变率 0.01/0.1/1/10 s⁻¹
 
-**数据集统计：** 71条应力应变曲线，涵盖不同温度和应变率工况
+**数据集统计：** 71条应力应变曲线，涵盖4种铝合金材料，不同温度和应变率工况
 
 ## 项目结构
 
@@ -185,19 +190,29 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 
 ## 参考文献
 
-### 核心文献
+### 数据来源文献
 
-1. El-Magd, E., et al. (2024). "Flow stress behavior of aluminum alloy 2024 at elevated temperatures and strain rates." *Journal of Materials Research and Technology*.
+1. **Al6061-T651 数据集**
+   Data in Brief (2019). "Stress-strain curves of aluminum 6061-T651 from 9 lots at 6 temperatures under uniaxial and plain strain tension." *Data in Brief*, DOI: 10.1016/j.dib.2019.104391
 
-2. Metals (2021). "Constitutive Modeling of Aluminum Alloy 2219 at Elevated Temperatures." *Metals*, 11(1), 77.
+2. **Al2024 数据集**
+   El-Magd, E., et al. (2024). "Flow stress behavior of aluminum alloy 2024 at elevated temperatures and strain rates." *Journal of Materials Research and Technology*.
 
-3. Frontiers in Materials (2024). "High-Temperature Deformation Behavior of Al7075-T6." *Frontiers in Materials*, 12, 1671753.
+3. **Al2219 数据集**
+   Metals (2021). "Constitutive Modeling of Aluminum Alloy 2219 at Elevated Temperatures." *Metals*, 11(1), 77.
 
-4. LSTM预测应力应变本构关系（95%精度）- 文献综述参考
+4. **Al7075-T6 数据集**
+   - Frontiers in Materials (2024). "High-Temperature Deformation Behavior of Al7075-T6." *Frontiers in Materials*, 12, 1671753.
+   - Materials MDPI (2023). "Flow Stress Characteristics of 7075 Aluminum Alloy." *Materials*, 16(21), 7432.
+   - China Foundry (2020). "Hot Deformation Behavior of 7075 Aluminum Alloy." *China Foundry*, 17(6), 494-502.
 
-5. Al-Mg-Zn铝合金数据驱动本构模型 - 文献综述参考
+### 方法论参考文献
 
-6. RNN考虑变形历史的2024铝合金研究 - 文献综述参考
+5. LSTM预测应力应变本构关系（95%精度）- 文献综述参考
+
+6. Al-Mg-Zn铝合金数据驱动本构模型 - 文献综述参考
+
+7. RNN考虑变形历史的2024铝合金研究 - 文献综述参考
 
 ### 数据集引用
 
