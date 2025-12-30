@@ -1,6 +1,7 @@
 *
 !.gitignore
 !AGENTS.md
+!README.md
 !src/
 !src/**
 !data/
@@ -17,3 +18,4 @@ __pycache__/
 **/__pycache__/
 *.pyc
 **/*.pyc
+CLAUDE.md
