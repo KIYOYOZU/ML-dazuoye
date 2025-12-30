@@ -1,0 +1,15 @@
+{
+  "r2": 0.40829211473464966,
+  "rmse": 119.59147175776164,
+  "mape": 382882432.0,
+  "mse": 14302.1201171875,
+  "samples": 28,
+  "epochs": 100,
+  "batch_size": 32,
+  "device": "cpu",
+  "seed": 42,
+  "seq_len": 50,
+  "alpha": 0.7,
+  "beta": 0.3,
+  "disable_physics": false
+}
