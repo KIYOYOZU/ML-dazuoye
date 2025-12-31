@@ -5,6 +5,8 @@
 !src/**
 !data/
 !data/**
+data/pdf/
+data/pdf/**
 !results/
 !results/**
 !images/

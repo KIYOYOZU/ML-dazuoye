@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from matplotlib import colormaps
 from matplotlib.colors import Normalize
 import shutil
 from pathlib import Path
@@ -96,6 +97,42 @@ def predict_samples(model, dataset, device):
 
     return results
 
+def _aggregate_by_temperature(results, material, strain_rate, grid_points=200):
+    filtered = [r for r in results if r['material'] == material and
+                abs(r['strain_rate'] - strain_rate) < 0.01]
+
+    if not filtered:
+        return []
+
+    grouped = {}
+    for r in filtered:
+        grouped.setdefault(r['temperature'], []).append(r)
+
+    aggregated = []
+    for temp, group in grouped.items():
+        min_max_strain = min(np.max(g['strain']) for g in group)
+        max_min_strain = max(np.min(g['strain']) for g in group)
+        if min_max_strain <= max_min_strain:
+            continue
+
+        grid = np.linspace(max_min_strain, min_max_strain, grid_points)
+        true_stack = []
+        pred_stack = []
+        for g in group:
+            true_stack.append(np.interp(grid, g['strain'], g['stress_true']))
+            pred_stack.append(np.interp(grid, g['strain'], g['stress_pred']))
+
+        aggregated.append({
+            'temperature': temp,
+            'strain': grid,
+            'stress_true': np.mean(true_stack, axis=0),
+            'stress_pred': np.mean(pred_stack, axis=0),
+            'count': len(group),
+        })
+
+    return sorted(aggregated, key=lambda x: x['temperature'])
+
+
 def plot_multi_temperature_comparison(results, material, strain_rate, output_path):
     """
     绘制多温度对比图（原始数据 vs 预测数据）
@@ -106,43 +143,25 @@ def plot_multi_temperature_comparison(results, material, strain_rate, output_pat
         strain_rate: 应变率
         output_path: 输出路径
     """
-    # 筛选数据
-    filtered = [r for r in results if r['material'] == material and
-                abs(r['strain_rate'] - strain_rate) < 0.01]
-
-    if len(filtered) == 0:
+    aggregated = _aggregate_by_temperature(results, material, strain_rate)
+    if len(aggregated) == 0:
         return
 
-    # 按温度排序
-    filtered = sorted(filtered, key=lambda x: x['temperature'])
-    temps = [r['temperature'] for r in filtered]
-
-    # 颜色映射
+    temps = [r['temperature'] for r in aggregated]
     norm = Normalize(vmin=min(temps), vmax=max(temps))
-    cmap = cm.get_cmap('coolwarm')
+    cmap = colormaps.get_cmap('coolwarm')
 
     # 创建图表
     fig, ax = plt.subplots(figsize=(10, 7))
 
-    # 绘制每个温度的曲线
-    for i, result in enumerate(filtered):
+    for result in aggregated:
         temp = result['temperature']
         color = cmap(norm(temp))
 
-        # 原始数据（实线）
         ax.plot(result['strain'], result['stress_true'],
-                color=color, linewidth=2, alpha=0.8,
-                label=f'{int(temp)}°C (Exp.)' if i == 0 else '')
-
-        # 预测数据（虚线）
+                color=color, linewidth=2.2, alpha=0.9)
         ax.plot(result['strain'], result['stress_pred'],
-                color=color, linewidth=2, linestyle='--', alpha=0.8,
-                label=f'{int(temp)}°C (Pred.)' if i == 0 else '')
-
-        # 在右侧标注温度
-        y_pos = result['stress_true'][-1]
-        ax.text(result['strain'][-1] + 0.01, y_pos, f'{int(temp)}K',
-                fontsize=9, va='center', color=color)
+                color=color, linewidth=2.2, linestyle='--', alpha=0.9)
 
     # 图表美化
     ax.set_xlabel('Strain ε', fontsize=12, fontweight='bold')
@@ -151,13 +170,17 @@ def plot_multi_temperature_comparison(results, material, strain_rate, output_pat
     title = f'{material.upper()} - Strain Rate: {strain_rate} s⁻¹'
     ax.set_title(title, fontsize=14, fontweight='bold')
 
-    # 图例
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], color='black', linewidth=2, label='Exp. Data'),
         Line2D([0], [0], color='black', linewidth=2, linestyle='--', label='Pred.'),
     ]
-    ax.legend(handles=legend_elements, loc='best', fontsize=10, framealpha=0.9)
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10, framealpha=0.9)
+
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label('Temperature (°C)', fontsize=10)
 
     ax.grid(True, alpha=0.3, linestyle='--')
 

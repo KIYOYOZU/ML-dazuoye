@@ -2,9 +2,9 @@
 
 ## 项目简介
 
-本项目是"机器学习基础理论及其在工程科学中的应用"课程的大作业，专注于使用物理信息神经网络（Physics-Informed Neural Network, PINN）方法预测铝合金材料在不同工况下的应力应变行为。
+本项目是"机器学习基础理论及其在工程科学中的应用"课程的大作业，专注于预测铝合金材料在不同工况下的应力应变曲线。
 
-**核心技术：** 物理增强LSTM + 数据驱动本构建模
+**核心技术：** 物理增强LSTM（PINN）+ 简化PD-ML（GBR基线）
 
 **研究材料：** Al2024, Al2219, Al6061, Al7075 四种铝合金
 
@@ -15,7 +15,8 @@
 - ✅ **真实应力应变统一**：所有数据统一为真实应力应变口径
 - ✅ **物理约束集成**：LSTM模型集成物理约束损失函数
 - ✅ **多材料多工况**：涵盖4种铝合金，71条应力应变曲线
-- ✅ **完整训练流程**：数据预处理、模型训练、评估与可视化
+- ✅ **完整训练流程**：数据预处理、训练、评估与可视化
+- ✅ **简化PD-ML准备**：近似 γ̇/H 数据与塑性段训练集已生成
 
 ## 数据来源
 
@@ -63,22 +64,30 @@
 │   ├── 筛选数据/                      # 筛选后的71条曲线
 │   └── processed/                     # 处理后的数据
 │       ├── 筛选数据_merged.csv        # 合并数据（真实应力应变）
+│       ├── 筛选数据_merged_with_plastic_metrics.csv   # 近似塑性指标
+│       ├── 筛选数据_pdml_with_mask.csv               # 平滑+塑性段标记
+│       ├── 筛选数据_pdml_ready.csv                   # 弱PD-ML训练集
 │       ├── train.pkl                  # 训练集
 │       ├── val.pkl                    # 验证集
 │       └── test.pkl                   # 测试集
 │
 ├── src/                               # 源代码
 │   ├── train_complete.py              # 完整训练脚本
+│   ├── visualize_comparison.py        # 预测对比可视化
+│   ├── pdml_simple_gbr.py             # GBR基线
+│   ├── derive_plastic_metrics.py      # 近似塑性指标生成
+│   ├── prepare_pdml_dataset.py        # 平滑+塑性段筛选
 │   ├── make_csv_together.py           # 数据合并脚本
 │   └── extract_figures_from_pdf.py    # PDF图片提取工具
 │
 ├── models/                            # 保存的模型
-│   └── physics_lstm_best.pth          # 最佳模型权重
+│   └── lstm_physics_best.pth          # 最佳模型权重
 │
 ├── results/                           # 实验结果
-│   ├── training_history.png           # 训练曲线
-│   ├── test_predictions.png           # 测试集预测对比
-│   └── evaluation_metrics.txt         # 评估指标
+│   ├── figures/                       # 对比图
+│   ├── metrics/                       # 评估指标
+│   ├── baseline_gbr/                  # GBR基线输出
+│   └── pdml_ready_summary.csv         # 弱PD-ML数据统计
 │
 └── requirements.txt                   # Python依赖
 ```
@@ -127,9 +136,8 @@ python src/train_complete.py
 ### 2. 查看结果
 
 训练完成后，结果保存在 `results/` 目录：
-- `training_history.png` - 训练和验证损失曲线
-- `test_predictions.png` - 测试集预测对比图
-- `evaluation_metrics.txt` - 详细评估指标（R², RMSE, MAPE）
+- `results/figures/` - 原始数据 vs 预测数据对比图
+- `results/metrics/` - 评估指标（R², RMSE, MAE 等）
 
 ### 3. 模型推理
 
@@ -137,16 +145,46 @@ python src/train_complete.py
 
 ```python
 import torch
-from src.train_complete import PhysicsInformedLSTM
+from src.train_complete import ImprovedStressStrainLSTM
 
 # 加载模型
-model = PhysicsInformedLSTM(input_size=3, hidden_size=128, num_layers=2)
-model.load_state_dict(torch.load('models/physics_lstm_best.pth'))
+model = ImprovedStressStrainLSTM(seq_len=100, hidden_size=128, num_layers=2, dropout=0.2)
+model.load_state_dict(torch.load('models/lstm_physics_best.pth')['model_state_dict'])
 model.eval()
 
 # 进行预测
 # ... (根据需要添加推理代码)
 ```
+
+### 4. 运行GBR基线（简化PD-ML）
+
+```bash
+python src/pdml_simple_gbr.py
+```
+
+输出：
+- `results/baseline_gbr/metrics.json`
+- `results/baseline_gbr/curve_rmse.csv`
+- `results/baseline_gbr/test_predictions.csv`
+
+### 5. 生成弱PD-ML训练数据（近似γ̇/H）
+
+```bash
+python src/derive_plastic_metrics.py
+python src/prepare_pdml_dataset.py
+```
+
+输出：
+- `data/processed/筛选数据_merged_with_plastic_metrics.csv`
+- `data/processed/筛选数据_pdml_ready.csv`
+
+### 6. 生成对比图
+
+```bash
+python src/visualize_comparison.py
+```
+
+注意：脚本默认会清空 `results/figures/` 后重绘。
 
 ## 模型架构
 
@@ -180,7 +218,7 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 | RMSE | < 20 MPa | 良好 |
 | MAPE | < 5% | 良好 |
 
-*具体数值请参考 `results/evaluation_metrics.txt`*
+*具体数值请参考 `results/metrics/` 与 `results/baseline_gbr/metrics.json`*
 
 ### 主要发现
 
@@ -223,7 +261,7 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 
 ## 项目状态
 
-**当前版本：** v1.0 (2025-12-30)
+**当前版本：** v1.1 (2025-12-31)
 
 **已完成：**
 - ✅ 数据收集与整理（71条曲线）
@@ -232,10 +270,12 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 - ✅ 物理增强LSTM模型开发
 - ✅ 模型训练与评估
 - ✅ 结果可视化
+- ✅ GBR基线（简化PD-ML）
+- ✅ 近似 γ̇/H 数据生成与塑性段筛选
 
 **待完成：**
 - ⏳ 物理约束验证（弹性模量、单调性）
-- ⏳ 模型对比实验（与传统ML方法对比）
+- ⏳ 弱PD-ML训练与对比（γ̇/H 近似）
 - ⏳ 技术报告撰写
 
 ## 注意事项
@@ -262,5 +302,5 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 
 ---
 
-**最后更新：** 2025年12月30日
-**项目状态：** 数据预处理与模型训练已完成，待报告整理
+**最后更新：** 2025年12月31日
+**项目状态：** PINN与GBR基线已完成，简化PD-ML数据已准备，待弱PD-ML训练与报告整理

@@ -119,6 +119,22 @@ def rebuild_dataset_from_merged(config):
         if temp_df['strain'].duplicated().any():
             temp_df = temp_df.groupby('strain', as_index=False)['stress_MPa'].mean()
 
+        temp_df = temp_df.sort_values('strain').reset_index(drop=True)
+
+        # 零点锚定：若起始应变>0则补(0,0)，若起始应变≈0但应力偏移则平移归零
+        min_idx = temp_df['strain'].idxmin()
+        min_strain = float(temp_df.loc[min_idx, 'strain'])
+        min_stress = float(temp_df.loc[min_idx, 'stress_MPa'])
+        if min_strain <= 1e-6:
+            if abs(min_stress) > 1e-3:
+                temp_df['stress_MPa'] = temp_df['stress_MPa'] - min_stress
+        else:
+            temp_df = pd.concat(
+                [pd.DataFrame({'strain': [0.0], 'stress_MPa': [0.0]}), temp_df],
+                ignore_index=True,
+            )
+            temp_df = temp_df.sort_values('strain').reset_index(drop=True)
+
         strain = temp_df['strain'].to_numpy(dtype=float)
         stress = temp_df['stress_MPa'].to_numpy(dtype=float)
 
@@ -138,6 +154,8 @@ def rebuild_dataset_from_merged(config):
 
         strain_seq = np.linspace(float(strain.min()), float(strain.max()), config['seq_len'])
         stress_seq = np.interp(strain_seq, strain, stress)
+        # 物理合理化：张拉应力不应为负
+        stress_seq = np.clip(stress_seq, 0.0, None)
 
         props = MATERIAL_FEATURES[material]
         temp_z = (temperature - temp_mean) / temp_std
@@ -329,22 +347,31 @@ class ImprovedStressStrainLSTM(nn.Module):
         cond_expand = cond_embed.unsqueeze(1).expand(-1, seq_len, -1)
         fused = torch.cat([lstm_out, cond_expand, strain_seq], dim=-1)
         stress_pred = self.fusion(fused) + self.strain_head(strain_seq)
+        # 零点锚定：强制首点应力为 0（假设序列已从最小应变开始）
+        stress_pred = stress_pred - stress_pred[:, :1, :]
         return stress_pred
 
 # ==================== 物理约束损失 ====================
 class PhysicsInformedLoss(nn.Module):
-    def __init__(self, alpha=0.70, beta=0.30):
+    def __init__(self, alpha=0.70, beta=0.30, low_strain_weight=2.0, low_strain_scale=0.02):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.low_strain_weight = low_strain_weight
+        self.low_strain_scale = low_strain_scale
 
         # 材料权重
         counts = torch.tensor([24, 20, 11, 16], dtype=torch.float32)
         self.material_weights = counts.sum() / (counts * 4)
 
     def forward(self, pred, target, batch_data):
-        # MSE损失
+        # MSE损失（低应变区域加权）
         mse = (pred - target) ** 2
+        strain_raw = torch.FloatTensor(batch_data['strain_seqs_raw']).to(pred.device)
+        point_weight = 1.0 + self.low_strain_weight * torch.exp(
+            -strain_raw / max(self.low_strain_scale, 1e-6)
+        )
+        mse = mse * point_weight.unsqueeze(-1)
         weights = self.material_weights[batch_data['material_ids']].to(pred.device)
         weights = weights.view(-1, 1, 1)
         mse_loss = (mse * weights).mean()
@@ -352,14 +379,14 @@ class PhysicsInformedLoss(nn.Module):
         # 物理约束
         if self.beta > 0:
             pred_raw = self._denormalize(pred, batch_data['stress_scalers'])
-            strain_raw = torch.FloatTensor(batch_data['strain_seqs_raw']).to(pred.device)
 
             physics_loss = (
-                self._elastic_modulus_constraint(strain_raw, pred_raw, batch_data['E_GPas']) * 0.25 +
-                self._monotonicity_constraint(pred_raw) * 0.20 +
-                self._stress_range_constraint(pred_raw, batch_data['material_ids']) * 0.20 +
-                self._temperature_softening_constraint(pred_raw, batch_data) * 0.20 +
-                self._strain_rate_sensitivity_constraint(pred_raw, batch_data) * 0.15
+                self._elastic_modulus_constraint(strain_raw, pred_raw, batch_data['E_GPas']) * 0.22 +
+                self._monotonicity_constraint(pred_raw) * 0.18 +
+                self._stress_range_constraint(pred_raw, batch_data['material_ids']) * 0.18 +
+                self._temperature_softening_constraint(pred_raw, batch_data) * 0.18 +
+                self._strain_rate_sensitivity_constraint(pred_raw, batch_data) * 0.14 +
+                self._zero_stress_constraint(strain_raw, pred_raw, batch_data['material_ids']) * 0.10
             )
         else:
             physics_loss = torch.tensor(0.0, device=pred.device)
@@ -406,6 +433,24 @@ class PhysicsInformedLoss(nn.Module):
         uts_limits = UTS[material_ids] * 1.2
         violations = torch.relu(max_stress - uts_limits)
         return violations.mean()
+
+    def _zero_stress_constraint(self, strain, stress, material_ids):
+        # 约束应变≈0 时应力接近 0（相对材料UTS归一化）
+        if strain.ndim == 3:
+            strain_vals = strain[:, :, 0]
+        else:
+            strain_vals = strain
+        if stress.ndim == 3:
+            stress_vals = stress[:, :, 0]
+        else:
+            stress_vals = stress
+
+        idx = torch.argmin(strain_vals, dim=1)
+        batch_idx = torch.arange(strain_vals.size(0), device=stress.device)
+        stress_at_zero = stress_vals[batch_idx, idx]
+        uts = torch.tensor([470, 400, 310, 570], device=stress.device)[material_ids]
+        rel = stress_at_zero / uts.clamp(min=1e-6)
+        return (rel ** 2).mean()
 
     def _temperature_softening_constraint(self, stress, batch_data):
         material_ids = batch_data['material_ids']
