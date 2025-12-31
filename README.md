@@ -16,7 +16,7 @@
 - ✅ **物理约束集成**：LSTM模型集成物理约束损失函数
 - ✅ **多材料多工况**：涵盖4种铝合金，71条应力应变曲线
 - ✅ **完整训练流程**：数据预处理、训练、评估与可视化
-- ✅ **简化PD-ML准备**：近似 γ̇/H 数据与塑性段训练集已生成
+- ✅ **简化PD-ML**：稳态塑性段筛选与 H log 特征已生成，弱PD-ML训练已完成
 
 ## 数据来源
 
@@ -65,8 +65,8 @@
 │   └── processed/                     # 处理后的数据
 │       ├── 筛选数据_merged.csv        # 合并数据（真实应力应变）
 │       ├── 筛选数据_merged_with_plastic_metrics.csv   # 近似塑性指标
-│       ├── 筛选数据_pdml_with_mask.csv               # 平滑+塑性段标记
-│       ├── 筛选数据_pdml_ready.csv                   # 弱PD-ML训练集
+│       ├── 筛选数据_pdml_with_mask.csv               # 平滑+塑性段标记（含 plastic_stable_mask / hardening_modulus_log）
+│       ├── 筛选数据_pdml_ready.csv                   # 弱PD-ML训练集（可按稳态区筛选）
 │       ├── train.pkl                  # 训练集
 │       ├── val.pkl                    # 验证集
 │       └── test.pkl                   # 测试集
@@ -76,7 +76,9 @@
 │   ├── visualize_comparison.py        # 预测对比可视化
 │   ├── pdml_simple_gbr.py             # GBR基线
 │   ├── derive_plastic_metrics.py      # 近似塑性指标生成
-│   ├── prepare_pdml_dataset.py        # 平滑+塑性段筛选
+│   ├── prepare_pdml_dataset.py        # 平滑+塑性段筛选（含稳态区与 H log）
+│   ├── pdml_weak_train.py             # 弱PD-ML训练（γ̇/H）
+│   ├── compare_models.py              # LSTM vs GBR/弱PD-ML 指标对比
 │   ├── make_csv_together.py           # 数据合并脚本
 │   └── extract_figures_from_pdf.py    # PDF图片提取工具
 │
@@ -87,6 +89,10 @@
 │   ├── figures/                       # 对比图
 │   ├── metrics/                       # 评估指标
 │   ├── baseline_gbr/                  # GBR基线输出
+│   ├── pdml_weak/                     # 弱PD-ML训练输出
+│   ├── model_comparison.csv           # LSTM vs GBR 对比指标
+│   ├── model_comparison.png           # LSTM vs GBR 对比图
+│   ├── pdml_weak_comparison.csv       # γ̇/H 指标对比表
 │   └── pdml_ready_summary.csv         # 弱PD-ML数据统计
 │
 └── requirements.txt                   # Python依赖
@@ -133,6 +139,8 @@ python src/train_complete.py
 - 训练物理增强LSTM模型
 - 生成评估报告和可视化结果
 
+可选：在 `src/train_complete.py` 的 `CONFIG` 中开启 `run_gbr_baseline` / `run_pdml_pipeline` / `run_pdml_weak` / `run_compare_models` / `run_visualize`，一键串联基线与弱PD-ML流水线。
+
 ### 2. 查看结果
 
 训练完成后，结果保存在 `results/` 目录：
@@ -176,15 +184,38 @@ python src/prepare_pdml_dataset.py
 
 输出：
 - `data/processed/筛选数据_merged_with_plastic_metrics.csv`
+- `data/processed/筛选数据_pdml_with_mask.csv`（含 `plastic_stable_mask` / `hardening_modulus_log`）
 - `data/processed/筛选数据_pdml_ready.csv`
+- `results/pdml_ready_summary.csv`
 
-### 6. 生成对比图
+### 6. 弱PD-ML训练（γ̇/H）
+
+```bash
+python src/pdml_weak_train.py
+```
+
+输出：
+- `results/pdml_weak/metrics.json`
+- `results/pdml_weak/test_predictions.csv`
+
+### 7. 生成模型对比指标（LSTM vs GBR / 弱PD-ML）
+
+```bash
+python src/compare_models.py
+```
+
+输出：
+- `results/model_comparison.csv`
+- `results/model_comparison.png`
+- `results/pdml_weak_comparison.csv`
+
+### 8. 生成对比图
 
 ```bash
 python src/visualize_comparison.py
 ```
 
-注意：脚本默认会清空 `results/figures/` 后重绘。
+注意：脚本默认会清空 `results/figures/` 后重绘；若存在 `results/training_history.json`，会同时输出 `results/figures/training_curves.png`。
 
 ## 模型架构
 
@@ -218,7 +249,13 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 | RMSE | < 20 MPa | 良好 |
 | MAPE | < 5% | 良好 |
 
-*具体数值请参考 `results/metrics/` 与 `results/baseline_gbr/metrics.json`*
+*具体数值请参考 `results/metrics/` 与 `results/baseline_gbr/metrics.json`*      
+
+### 弱PD-ML（γ̇/H）结果（测试集）
+
+- γ̇：R²≈0.991，RMSE≈0.438
+- H（log10 空间）：R²≈0.770，RMSE≈0.448（稳态区 + 正值样本，n=166）
+- H（线性空间，对照）：R²≈0.548，RMSE≈1710 MPa
 
 ### 主要发现
 
@@ -261,7 +298,7 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 
 ## 项目状态
 
-**当前版本：** v1.1 (2025-12-31)
+**当前版本：** v1.2 (2025-12-31)
 
 **已完成：**
 - ✅ 数据收集与整理（71条曲线）
@@ -271,11 +308,11 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 - ✅ 模型训练与评估
 - ✅ 结果可视化
 - ✅ GBR基线（简化PD-ML）
-- ✅ 近似 γ̇/H 数据生成与塑性段筛选
+- ✅ 近似 γ̇/H 数据生成与塑性段筛选（含稳态区与 H log）
+- ✅ 弱PD-ML训练与对比（γ̇/H）
 
 **待完成：**
 - ⏳ 物理约束验证（弹性模量、单调性）
-- ⏳ 弱PD-ML训练与对比（γ̇/H 近似）
 - ⏳ 技术报告撰写
 
 ## 注意事项
@@ -303,4 +340,4 @@ Total Loss = MSE Loss + λ₁ × Physics Loss
 ---
 
 **最后更新：** 2025年12月31日
-**项目状态：** PINN与GBR基线已完成，简化PD-ML数据已准备，待弱PD-ML训练与报告整理
+**项目状态：** PINN与GBR基线已完成，弱PD-ML训练已完成，待报告整理

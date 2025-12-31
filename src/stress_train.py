@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-完整的训练程序 - 铝合金应力应变曲线预测
-包含: 数据加载、模型定义、物理约束损失、训练循环、评估、可视化
+应力应变曲线训练入口
+包含: 数据加载、模型定义、物理约束损失、训练循环、评估，集成GBR基线
 """
 
 import os
@@ -15,7 +15,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from sklearn.metrics import r2_score, mean_squared_error
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn.ensemble import GradientBoostingRegressor
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -39,6 +40,9 @@ CONFIG = {
     'early_stop_patience': 50,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'seed': 42,
+    # 额外流水线（GBR基线 + 对比汇总）
+    'run_gbr_baseline': True,
+    'run_compare_models': True,
 }
 
 # 材料基础参数（来自既有训练数据的特征分布）
@@ -611,47 +615,215 @@ def evaluate_model(model, loader, device):
 
     return overall_metrics, per_material_metrics
 
-def plot_results(history, test_metrics, per_material_metrics, output_dir):
-    """绘制结果图表"""
-    output_dir = Path(output_dir)
-    fig_dir = output_dir / "results" / "figures"
-    fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # 训练曲线
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+def gbr_clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["strain"] = df["strain"].clip(lower=0.0)
+    return df.dropna(subset=["strain", "stress_MPa", "temperature", "strain_rate", "material"])
 
-    axes[0, 0].plot(history['train_loss'], label='Train')
-    axes[0, 0].plot(history['val_loss'], label='Val')
-    axes[0, 0].set_title('Total Loss')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True, alpha=0.3)
 
-    axes[0, 1].plot(history['train_mse'], label='Train')
-    axes[0, 1].plot(history['val_mse'], label='Val')
-    axes[0, 1].set_title('MSE Loss')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True, alpha=0.3)
+def gbr_add_material_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    mats = []
+    for m in df["material"]:
+        if m not in MATERIAL_FEATURES:
+            raise ValueError(f"Unknown material: {m}")
+        mats.append(MATERIAL_FEATURES[m])
+    mat_df = pd.DataFrame(mats)
+    return pd.concat([df.reset_index(drop=True), mat_df.reset_index(drop=True)], axis=1)
 
-    axes[1, 0].plot(history['train_physics'], label='Train')
-    axes[1, 0].plot(history['val_physics'], label='Val')
-    axes[1, 0].set_title('Physics Loss')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].legend()
-    axes[1, 0].grid(True, alpha=0.3)
 
-    axes[1, 1].plot(history['lr'])
-    axes[1, 1].set_title('Learning Rate')
-    axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_yscale('log')
-    axes[1, 1].grid(True, alpha=0.3)
+def gbr_split_by_curve(df: pd.DataFrame) -> tuple[list[str], list[str], list[str]]:
+    curve_meta = df.groupby("source_file").first()[["material"]]
+    rng = np.random.default_rng(CONFIG["split_seed"])
+    train_files, val_files, test_files = [], [], []
 
-    plt.tight_layout()
-    plt.savefig(fig_dir / 'training_curves.png', dpi=300, bbox_inches='tight')
-    plt.close()
+    for material in sorted(curve_meta["material"].unique()):
+        files = sorted(curve_meta[curve_meta["material"] == material].index.tolist())
+        rng.shuffle(files)
+        n = len(files)
+        n_train = int(round(n * CONFIG["split_ratio"]["train"]))
+        n_val = int(round(n * CONFIG["split_ratio"]["val"]))
+        if n_train + n_val > n:
+            n_train = max(0, n - n_val)
+        train_files.extend(files[:n_train])
+        val_files.extend(files[n_train:n_train + n_val])
+        test_files.extend(files[n_train + n_val:])
 
-    print(f"  训练曲线已保存: {fig_dir / 'training_curves.png'}")
+    return train_files, val_files, test_files
+
+
+def gbr_build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["log_strain_rate"] = np.log10(df["strain_rate"].clip(lower=1e-12))
+    feature_cols = [
+        "strain",
+        "temperature",
+        "log_strain_rate",
+        "material_id",
+        "E_GPa",
+        "c1",
+        "c2",
+        "c3",
+        "c4",
+        "c5",
+    ]
+    return df[feature_cols].astype(float)
+
+
+def gbr_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    return {
+        "r2": float(r2_score(y_true, y_pred)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "n": int(len(y_true)),
+    }
+
+
+def run_gbr_baseline(base_dir: Path) -> None:
+    merged_csv = base_dir / "data" / "processed" / "筛选数据_merged.csv"
+    df = pd.read_csv(merged_csv)
+    df = gbr_clean_data(df)
+    df = gbr_add_material_features(df)
+
+    train_files, val_files, test_files = gbr_split_by_curve(df)
+    train_df = df[df["source_file"].isin(train_files)].copy()
+    val_df = df[df["source_file"].isin(val_files)].copy()
+    test_df = df[df["source_file"].isin(test_files)].copy()
+
+    X_train = gbr_build_features(train_df)
+    X_val = gbr_build_features(val_df)
+    X_test = gbr_build_features(test_df)
+
+    y_train = train_df["stress_MPa"].to_numpy(dtype=float)
+    y_val = val_df["stress_MPa"].to_numpy(dtype=float)
+    y_test = test_df["stress_MPa"].to_numpy(dtype=float)
+
+    scaler = StandardScaler()
+    X_train_s = scaler.fit_transform(X_train)
+    X_val_s = scaler.transform(X_val)
+    X_test_s = scaler.transform(X_test)
+
+    model = GradientBoostingRegressor(
+        n_estimators=1200,
+        learning_rate=0.03,
+        max_depth=4,
+        min_samples_split=2,
+        min_samples_leaf=2,
+        subsample=1.0,
+        random_state=42,
+    )
+    model.fit(X_train_s, y_train)
+
+    pred_train = model.predict(X_train_s)
+    pred_val = model.predict(X_val_s)
+    pred_test = model.predict(X_test_s)
+
+    metrics = {
+        "train": gbr_eval_metrics(y_train, pred_train),
+        "val": gbr_eval_metrics(y_val, pred_val),
+        "test": gbr_eval_metrics(y_test, pred_test),
+    }
+
+    per_material = {}
+    for mat in sorted(test_df["material"].unique()):
+        idx = test_df["material"] == mat
+        per_material[mat] = gbr_eval_metrics(y_test[idx.values], pred_test[idx.values])
+
+    test_out = test_df.copy()
+    test_out["stress_pred"] = pred_test
+    curve_rmse = []
+    for source_file, g in test_out.groupby("source_file"):
+        rmse = float(np.sqrt(mean_squared_error(g["stress_MPa"], g["stress_pred"])))
+        curve_rmse.append({"source_file": source_file, "material": g["material"].iloc[0], "rmse": rmse, "n": int(len(g))})
+
+    output_dir = base_dir / "results" / "baseline_gbr"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(output_dir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump({"overall": metrics, "per_material": per_material}, f, indent=2)
+
+    pd.DataFrame(curve_rmse).sort_values("rmse", ascending=False).to_csv(
+        output_dir / "curve_rmse.csv", index=False
+    )
+    test_out.to_csv(output_dir / "test_predictions.csv", index=False)
+
+    X_all = gbr_build_features(df)
+    X_all_s = scaler.transform(X_all)
+    pred_all = model.predict(X_all_s)
+    all_out = df.copy()
+    all_out["stress_pred"] = pred_all
+    all_out.to_csv(output_dir / "all_predictions.csv", index=False)
+
+    print("GBR baseline done")
+    print("overall test:", metrics["test"])
+    print("per_material:", per_material)
+    print("outputs:", str(output_dir))
+
+
+def run_compare_models(base_dir: Path) -> None:
+    rows = []
+
+    lstm_path = base_dir / "results" / "metrics" / "test_metrics.json"
+    if lstm_path.exists():
+        with open(lstm_path, "r", encoding="utf-8") as f:
+            lstm = json.load(f)
+        rows.append({
+            "model": "LSTM_PINN",
+            "r2": lstm.get("r2"),
+            "rmse": lstm.get("rmse"),
+            "mae": lstm.get("mae"),
+            "samples": lstm.get("samples"),
+        })
+
+    gbr_path = base_dir / "results" / "baseline_gbr" / "metrics.json"
+    if gbr_path.exists():
+        with open(gbr_path, "r", encoding="utf-8") as f:
+            gbr = json.load(f)
+        if "overall" in gbr and "test" in gbr["overall"]:
+            t = gbr["overall"]["test"]
+            rows.append({
+                "model": "GBR_baseline",
+                "r2": t.get("r2"),
+                "rmse": t.get("rmse"),
+                "mae": t.get("mae"),
+                "samples": t.get("n"),
+            })
+
+    out_path = base_dir / "results" / "model_comparison.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, index=False)
+
+    if not df.empty:
+        fig, ax1 = plt.subplots(figsize=(7, 4.5))
+        df_plot = df.set_index("model")
+        df_plot["r2"].plot(kind="bar", ax=ax1, color="#3B82F6", alpha=0.85)
+        ax1.set_ylabel("R2")
+        ax1.set_ylim(0, 1.05)
+        ax1.grid(True, axis="y", alpha=0.3, linestyle="--")
+        ax1.set_title("Stress Prediction Comparison")
+        plt.tight_layout()
+        plt.savefig(base_dir / "results" / "model_comparison.png", dpi=300, bbox_inches="tight")
+        plt.close()
+
+    pdml_path = base_dir / "results" / "pdml_weak" / "metrics.json"
+    if pdml_path.exists():
+        with open(pdml_path, "r", encoding="utf-8") as f:
+            pdml = json.load(f)
+        rows_pdml = []
+        for key in ("gamma", "H"):
+            if key in pdml and "test" in pdml[key]:
+                t = pdml[key]["test"]
+                rows_pdml.append({
+                    "target": key,
+                    "r2": t.get("r2"),
+                    "rmse": t.get("rmse"),
+                    "mae": t.get("mae"),
+                    "samples": t.get("n"),
+                })
+        if rows_pdml:
+            pd.DataFrame(rows_pdml).to_csv(base_dir / "results" / "pdml_weak_comparison.csv", index=False)
 
 # ==================== 主函数 ====================
 def main():
@@ -805,8 +977,15 @@ def main():
     with open(output_dir / "results" / "training_history.json", 'w') as f:
         json.dump(history, f, indent=2)
 
-    # 绘制结果
-    plot_results(history, test_metrics, per_material_metrics, output_dir)
+    base_dir = Path(CONFIG['output_dir'])
+
+    if CONFIG.get('run_gbr_baseline'):
+        print("\n运行GBR基线...")
+        run_gbr_baseline(base_dir)
+
+    if CONFIG.get('run_compare_models'):
+        print("\n汇总模型对比指标...")
+        run_compare_models(base_dir)
 
     print("\n" + "="*60)
     print("训练完成！")
