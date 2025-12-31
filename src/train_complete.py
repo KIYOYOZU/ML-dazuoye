@@ -34,8 +34,8 @@ CONFIG = {
     'dropout': 0.2,  # 减小dropout
     'epochs': 300,
     'lr': 0.002,  # 提高学习率
-    'alpha': 1.00,  # MSE权重（纯MSE）
-    'beta': 0.00,   # 物理约束权重（完全关闭）
+    'alpha': 1.00,  # MSE权重
+    'beta': 0.20,   # 物理约束权重（启用）
     'early_stop_patience': 50,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'seed': 42,
