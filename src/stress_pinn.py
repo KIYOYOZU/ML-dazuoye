@@ -34,6 +34,7 @@ CONFIG = {
     "filter_test_type": "tensile",
     "split_ratio": {"train": 0.75, "val": 0.125, "test": 0.125},
     "split_seed": 42,
+    "min_test_curves": 1,  # 每种材料至少保留的测试曲线数
     # 模型参数
     "hidden_dims": [256, 256, 128, 64],
     "dropout": 0.05,
@@ -48,6 +49,13 @@ CONFIG = {
     "lambda_elastic": 0.001,
     "lambda_temp_soft": 0.01,
     "lambda_rate_hard": 0.01,
+    # 材料权重（数据少的材料给更高权重）
+    "material_weights": {
+        "al2024": 1.0,
+        "al2219": 1.2,
+        "al6061": 3.0,  # 数据最少，给最高权重
+        "al7075": 1.5,
+    },
 }
 
 # 材料物理参数（与 stress_train.py 一致）
@@ -129,20 +137,33 @@ def add_material_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def split_by_curve(df: pd.DataFrame):
-    """按曲线划分数据集"""
+    """按曲线划分数据集，确保每种材料至少有 min_test_curves 条测试曲线"""
     curve_meta = df.groupby("source_file").first()[["material"]]
     rng = np.random.default_rng(CONFIG["split_seed"])
     train_files, val_files, test_files = [], [], []
+    min_test = CONFIG.get("min_test_curves", 1)
 
     for material in sorted(curve_meta["material"].unique()):
         files = sorted(curve_meta[curve_meta["material"] == material].index.tolist())
         rng.shuffle(files)
         n = len(files)
-        n_train = int(round(n * CONFIG["split_ratio"]["train"]))
-        n_val = int(round(n * CONFIG["split_ratio"]["val"]))
+
+        # 先确保至少有 min_test 条测试数据
+        n_test = max(min_test, int(round(n * CONFIG["split_ratio"]["test"])))
+        n_val = max(1, int(round(n * CONFIG["split_ratio"]["val"])))
+
+        # 确保不会超过总数
+        if n_test + n_val >= n:
+            n_test = min(min_test, n - 1) if n > 1 else 0
+            n_val = min(1, n - n_test - 1) if n - n_test > 1 else 0
+
+        n_train = n - n_val - n_test
+
         train_files.extend(files[:n_train])
         val_files.extend(files[n_train:n_train + n_val])
         test_files.extend(files[n_train + n_val:])
+
+        print(f"  {material}: {n}条 -> 训练{n_train}, 验证{n_val}, 测试{n_test}")
 
     return train_files, val_files, test_files
 
@@ -153,7 +174,7 @@ def build_features(df: pd.DataFrame) -> np.ndarray:
 
 
 def create_dataloaders(df, train_files, val_files, test_files, scaler_X, scaler_y):
-    """创建数据加载器"""
+    """创建数据加载器（带材料权重）"""
     train_df = df[df["source_file"].isin(train_files)].copy()
     val_df = df[df["source_file"].isin(val_files)].copy()
     test_df = df[df["source_file"].isin(test_files)].copy()
@@ -178,11 +199,25 @@ def create_dataloaders(df, train_files, val_files, test_files, scaler_X, scaler_
     E_train = train_df["E_GPa"].values.astype(np.float32).reshape(-1, 1) * 1000  # GPa -> MPa
     E_val = val_df["E_GPa"].values.astype(np.float32).reshape(-1, 1) * 1000
 
+    # 计算材料权重
+    material_weights = CONFIG.get("material_weights", {})
+    weights_train = np.array([
+        material_weights.get(m, 1.0) for m in train_df["material"]
+    ], dtype=np.float32)
+
+    # 显示权重统计
+    print("  材料权重统计:")
+    for mat in sorted(train_df["material"].unique()):
+        w = material_weights.get(mat, 1.0)
+        cnt = (train_df["material"] == mat).sum()
+        print(f"    {mat}: {cnt}样本 x {w}权重 = 有效样本{cnt * w:.0f}")
+
     train_dataset = TensorDataset(
         torch.from_numpy(X_train_s),
         torch.from_numpy(y_train_s),
         torch.from_numpy(X_train),
         torch.from_numpy(E_train),
+        torch.from_numpy(weights_train.reshape(-1, 1)),  # 添加权重
     )
     val_dataset = TensorDataset(
         torch.from_numpy(X_val_s),
@@ -274,16 +309,18 @@ def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
     total_loss = 0
     loss_components = {"data": 0, "mono": 0, "elastic": 0, "temp": 0, "rate": 0}
 
-    for X_scaled, y_scaled, X_raw, E_MPa in train_loader:
+    for X_scaled, y_scaled, X_raw, E_MPa, weights in train_loader:
         X_scaled = X_scaled.to(DEVICE)
         y_scaled = y_scaled.to(DEVICE)
         X_raw = X_raw.to(DEVICE)
         E_MPa = E_MPa.to(DEVICE)
+        weights = weights.to(DEVICE)
 
         optimizer.zero_grad()
         y_pred, dsigma_de, dsigma_dT, dsigma_dlograte = physics_loss.compute_gradients(model, X_scaled)
 
-        loss_data = criterion(y_pred, y_scaled)
+        # 加权MSE损失
+        loss_data = torch.mean(weights * (y_pred - y_scaled) ** 2)
         loss_mono = physics_loss.monotonicity_loss(dsigma_de)
         loss_elastic = physics_loss.elastic_modulus_loss(dsigma_de, X_raw, E_MPa)
         loss_temp = physics_loss.temperature_softening_loss(dsigma_dT)
