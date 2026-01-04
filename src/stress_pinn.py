@@ -56,6 +56,12 @@ CONFIG = {
         "al6061": 3.0,  # 数据最少，给最高权重
         "al7075": 1.5,
     },
+    # 边界条件约束（使用collocation points方式）
+    "lambda_boundary": 0.0,  # 禁用原始边界约束
+    "boundary_strain_threshold": 0.002,
+    # 零应变collocation points配置
+    "use_collocation_points": True,  # 启用collocation points
+    "n_collocation_per_material": 50,  # 每种材料生成的零应变点数
 }
 
 # 材料物理参数（与 stress_train.py 一致）
@@ -173,11 +179,59 @@ def build_features(df: pd.DataFrame) -> np.ndarray:
     return df[FEATURE_COLS].values.astype(np.float32)
 
 
+def generate_collocation_points(train_df: pd.DataFrame, n_per_material: int = 50) -> pd.DataFrame:
+    """生成零应变collocation points（应变=0时应力=0）
+
+    为每种材料生成覆盖其温度和应变率范围的零应变点
+    """
+    collocation_data = []
+
+    for material in train_df["material"].unique():
+        mat_df = train_df[train_df["material"] == material]
+        mat_feat = MATERIAL_FEATURES[material]
+
+        # 获取该材料的温度和应变率范围
+        temps = mat_df["temperature"].unique()
+        rates = mat_df["strain_rate"].unique()
+
+        # 生成均匀分布的温度和应变率组合
+        n_temps = min(len(temps), int(np.sqrt(n_per_material)) + 1)
+        n_rates = min(len(rates), n_per_material // n_temps + 1)
+
+        selected_temps = np.linspace(temps.min(), temps.max(), n_temps)
+        selected_rates = np.geomspace(max(rates.min(), 1e-6), rates.max(), n_rates)
+
+        for temp in selected_temps:
+            for rate in selected_rates:
+                row = {
+                    "source_file": f"collocation_{material}",
+                    "material": material,
+                    "temperature": temp,
+                    "strain_rate": rate,
+                    "strain": 0.0,  # 零应变
+                    "stress_MPa": 0.0,  # 零应力（边界条件）
+                    "log_strain_rate": np.log10(max(rate, 1e-12)),
+                    **mat_feat,
+                }
+                collocation_data.append(row)
+
+    collocation_df = pd.DataFrame(collocation_data)
+    return collocation_df
+
+
 def create_dataloaders(df, train_files, val_files, test_files, scaler_X, scaler_y):
-    """创建数据加载器（带材料权重）"""
+    """创建数据加载器（带材料权重和collocation points）"""
     train_df = df[df["source_file"].isin(train_files)].copy()
     val_df = df[df["source_file"].isin(val_files)].copy()
     test_df = df[df["source_file"].isin(test_files)].copy()
+
+    # 添加零应变collocation points
+    if CONFIG.get("use_collocation_points", False):
+        n_per_mat = CONFIG.get("n_collocation_per_material", 50)
+        collocation_df = generate_collocation_points(train_df, n_per_mat)
+        print(f"  生成collocation points: {len(collocation_df)} 个零应变点")
+        # 合并到训练集
+        train_df = pd.concat([train_df, collocation_df], ignore_index=True)
 
     X_train = build_features(train_df)
     X_val = build_features(val_df)
@@ -199,18 +253,28 @@ def create_dataloaders(df, train_files, val_files, test_files, scaler_X, scaler_
     E_train = train_df["E_GPa"].values.astype(np.float32).reshape(-1, 1) * 1000  # GPa -> MPa
     E_val = val_df["E_GPa"].values.astype(np.float32).reshape(-1, 1) * 1000
 
-    # 计算材料权重
+    # 计算材料权重（collocation points给更高权重）
     material_weights = CONFIG.get("material_weights", {})
-    weights_train = np.array([
-        material_weights.get(m, 1.0) for m in train_df["material"]
-    ], dtype=np.float32)
+    collocation_weight = 2.0  # collocation points的权重倍数
+
+    weights_train = []
+    for idx, row in train_df.iterrows():
+        base_weight = material_weights.get(row["material"], 1.0)
+        if str(row.get("source_file", "")).startswith("collocation_"):
+            weights_train.append(base_weight * collocation_weight)
+        else:
+            weights_train.append(base_weight)
+    weights_train = np.array(weights_train, dtype=np.float32)
 
     # 显示权重统计
     print("  材料权重统计:")
     for mat in sorted(train_df["material"].unique()):
+        mat_mask = train_df["material"] == mat
+        colloc_mask = train_df["source_file"].str.startswith("collocation_")
+        n_data = (~colloc_mask & mat_mask).sum()
+        n_colloc = (colloc_mask & mat_mask).sum()
         w = material_weights.get(mat, 1.0)
-        cnt = (train_df["material"] == mat).sum()
-        print(f"    {mat}: {cnt}样本 x {w}权重 = 有效样本{cnt * w:.0f}")
+        print(f"    {mat}: {n_data}数据 + {n_colloc}边界点, 权重={w}")
 
     train_dataset = TensorDataset(
         torch.from_numpy(X_train_s),
@@ -302,12 +366,32 @@ class PhysicsLoss:
         violation = torch.relu(-dsigma_dlograte)
         return torch.mean(violation ** 2)
 
+    def boundary_condition_loss(self, y_pred_scaled, X_raw):
+        """边界条件损失: σ(ε≈0) = 0
+
+        在应变接近0时，应力也应该接近0
+        """
+        strain = X_raw[:, 0:1]
+        threshold = CONFIG.get("boundary_strain_threshold", 0.005)
+        mask = (strain < threshold).float()
+
+        if mask.sum() < 1:
+            return torch.tensor(0.0, device=DEVICE)
+
+        # 将预测值转换回真实尺度
+        y_pred_real = y_pred_scaled * self.y_std + self.y_mean
+
+        # 惩罚非零应力，使用相对误差避免量纲问题
+        # 在低应变区域，应力应该接近0
+        boundary_error = mask * (y_pred_real ** 2)
+        return torch.sum(boundary_error) / (mask.sum() + 1e-6)
+
 
 # ==================== 训练 ====================
 def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
     model.train()
     total_loss = 0
-    loss_components = {"data": 0, "mono": 0, "elastic": 0, "temp": 0, "rate": 0}
+    loss_components = {"data": 0, "mono": 0, "elastic": 0, "temp": 0, "rate": 0, "boundary": 0}
 
     for X_scaled, y_scaled, X_raw, E_MPa, weights in train_loader:
         X_scaled = X_scaled.to(DEVICE)
@@ -325,12 +409,14 @@ def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
         loss_elastic = physics_loss.elastic_modulus_loss(dsigma_de, X_raw, E_MPa)
         loss_temp = physics_loss.temperature_softening_loss(dsigma_dT)
         loss_rate = physics_loss.strain_rate_hardening_loss(dsigma_dlograte)
+        loss_boundary = physics_loss.boundary_condition_loss(y_pred, X_raw)
 
         loss = (CONFIG["lambda_data"] * loss_data +
                 CONFIG["lambda_monotonic"] * loss_mono +
                 CONFIG["lambda_elastic"] * loss_elastic +
                 CONFIG["lambda_temp_soft"] * loss_temp +
-                CONFIG["lambda_rate_hard"] * loss_rate)
+                CONFIG["lambda_rate_hard"] * loss_rate +
+                CONFIG["lambda_boundary"] * loss_boundary)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -342,6 +428,7 @@ def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
         loss_components["elastic"] += loss_elastic.item()
         loss_components["temp"] += loss_temp.item()
         loss_components["rate"] += loss_rate.item()
+        loss_components["boundary"] += loss_boundary.item()
 
     n_batches = len(train_loader)
     return total_loss / n_batches, {k: v / n_batches for k, v in loss_components.items()}
@@ -415,7 +502,7 @@ def main():
 
     print("\n[3] 开始训练...")
     print(f"  物理约束权重: mono={CONFIG['lambda_monotonic']}, elastic={CONFIG['lambda_elastic']}, "
-          f"temp={CONFIG['lambda_temp_soft']}, rate={CONFIG['lambda_rate_hard']}")
+          f"temp={CONFIG['lambda_temp_soft']}, rate={CONFIG['lambda_rate_hard']}, boundary={CONFIG['lambda_boundary']}")
 
     best_val_loss = float("inf")
     best_model_state = None
@@ -437,7 +524,7 @@ def main():
         if (epoch + 1) % 50 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:3d}/{CONFIG['epochs']}: "
                   f"train={train_loss:.4f}, val={val_loss:.4f}, "
-                  f"data={loss_comp['data']:.4f}, mono={loss_comp['mono']:.4f}")
+                  f"data={loss_comp['data']:.4f}, mono={loss_comp['mono']:.4f}, boundary={loss_comp['boundary']:.4f}")
 
     model.load_state_dict(best_model_state)
 

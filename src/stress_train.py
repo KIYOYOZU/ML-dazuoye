@@ -3,6 +3,8 @@
 """
 GBR应力应变训练入口（仅保留GBR基线）
 包含: 数据加载、特征构建、训练、评估、结果保存
+新增: 温度/应变率中值预测（用于可视化外推能力）
+新增: 预测平滑处理（Savitzky-Golay滤波）
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
@@ -26,12 +29,104 @@ CONFIG = {
 }
 
 # 材料基础参数（来自既有训练数据的特征分布）
+# c1~c5: Johnson-Cook 模型 5 个常数（A, B, n, C, m）作为固定材料特征使用
+# 元素含量：wt%，区间取中值；“≤”取上限；Al=100-其它元素之和；Al6061 为 Lot A/D/G/I 平均
 MATERIAL_FEATURES = {
-    "al2024": {"material_id": 0, "E_GPa": 73.1, "c1": 325.0, "c2": 0.33, "c3": 22.78, "c4": 502.0, "c5": 2.29e-05},
-    "al2219": {"material_id": 1, "E_GPa": 73.1, "c1": 350.0, "c2": 0.33, "c3": 22.84, "c4": 543.0, "c5": 2.23e-05},
-    "al6061": {"material_id": 2, "E_GPa": 68.9, "c1": 276.0, "c2": 0.33, "c3": 22.70, "c4": 582.0, "c5": 2.36e-05},
-    "al7075": {"material_id": 3, "E_GPa": 71.7, "c1": 503.0, "c2": 0.33, "c3": 22.81, "c4": 477.0, "c5": 2.32e-05},
+    "al2024": {
+        "material_id": 0,
+        "E_GPa": 73.1,
+        "c1": 325.0,
+        "c2": 0.33,
+        "c3": 22.78,
+        "c4": 502.0,
+        "c5": 2.29e-05,
+        "Si_wt": 0.50,
+        "Fe_wt": 0.50,
+        "Cu_wt": 4.35,
+        "Mn_wt": 0.60,
+        "Mg_wt": 1.50,
+        "Cr_wt": 0.10,
+        "Zn_wt": 0.25,
+        "Ti_wt": 2.00,
+        "Zr_wt": 0.00,
+        "V_wt": 0.00,
+        "Al_wt": 90.20,
+    },
+    "al2219": {
+        "material_id": 1,
+        "E_GPa": 73.1,
+        "c1": 350.0,
+        "c2": 0.33,
+        "c3": 22.84,
+        "c4": 543.0,
+        "c5": 2.23e-05,
+        "Si_wt": 0.20,
+        "Fe_wt": 0.30,
+        "Cu_wt": 6.30,
+        "Mn_wt": 0.30,
+        "Mg_wt": 0.02,
+        "Cr_wt": 0.00,
+        "Zn_wt": 0.10,
+        "Ti_wt": 0.06,
+        "Zr_wt": 0.175,
+        "V_wt": 0.10,
+        "Al_wt": 92.445,
+    },
+    "al6061": {
+        "material_id": 2,
+        "E_GPa": 68.9,
+        "c1": 276.0,
+        "c2": 0.33,
+        "c3": 22.70,
+        "c4": 582.0,
+        "c5": 2.36e-05,
+        "Si_wt": 0.63,
+        "Fe_wt": 0.2225,
+        "Cu_wt": 0.195,
+        "Mn_wt": 0.045,
+        "Mg_wt": 0.8775,
+        "Cr_wt": 0.0525,
+        "Zn_wt": 0.02,
+        "Ti_wt": 0.015,
+        "Zr_wt": 0.00,
+        "V_wt": 0.00,
+        "Al_wt": 97.9425,
+    },
+    "al7075": {
+        "material_id": 3,
+        "E_GPa": 71.7,
+        "c1": 503.0,
+        "c2": 0.33,
+        "c3": 22.81,
+        "c4": 477.0,
+        "c5": 2.32e-05,
+        "Si_wt": 0.40,
+        "Fe_wt": 0.50,
+        "Cu_wt": 1.60,
+        "Mn_wt": 0.30,
+        "Mg_wt": 2.50,
+        "Cr_wt": 0.23,
+        "Zn_wt": 5.60,
+        "Ti_wt": 0.20,
+        "Zr_wt": 0.00,
+        "V_wt": 0.00,
+        "Al_wt": 88.67,
+    },
 }
+
+COMPOSITION_FEATURE_COLS = [
+    "Si_wt",
+    "Fe_wt",
+    "Cu_wt",
+    "Mn_wt",
+    "Mg_wt",
+    "Cr_wt",
+    "Zn_wt",
+    "Ti_wt",
+    "Zr_wt",
+    "V_wt",
+    "Al_wt",
+]
 
 
 def _filter_by_test_type(df: pd.DataFrame, test_type: str | None):
@@ -98,7 +193,7 @@ def gbr_build_features(df: pd.DataFrame) -> pd.DataFrame:
         "c3",
         "c4",
         "c5",
-    ]
+    ] + COMPOSITION_FEATURE_COLS
     return df[feature_cols].astype(float)
 
 
@@ -109,6 +204,126 @@ def gbr_eval_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
         "mae": float(mean_absolute_error(y_true, y_pred)),
         "n": int(len(y_true)),
     }
+
+
+def build_temperature_midpoints(temps: list[float]) -> list[float]:
+    """计算相邻温度的中值点"""
+    uniq = sorted(set(temps))
+    if len(uniq) < 2:
+        return []
+    midpoints = []
+    for i in range(len(uniq) - 1):
+        midpoints.append((uniq[i] + uniq[i + 1]) / 2.0)
+    return midpoints
+
+
+def build_rate_midpoints(rates: list[float]) -> list[float]:
+    """计算相邻应变率的中值点"""
+    uniq = sorted(set(rates))
+    if len(uniq) < 2:
+        return []
+    midpoints = []
+    for i in range(len(uniq) - 1):
+        midpoints.append((uniq[i] + uniq[i + 1]) / 2.0)
+    return midpoints
+
+
+def build_strain_grid(df_group: pd.DataFrame, n_points: int = 200) -> np.ndarray | None:
+    """构建应变网格（取所有曲线的公共应变范围）"""
+    per_curve_max = df_group.groupby("source_file")["strain"].max().to_numpy()
+    per_curve_min = df_group.groupby("source_file")["strain"].min().to_numpy()
+    if len(per_curve_max) == 0:
+        return None
+    max_strain = float(np.min(per_curve_max))
+    min_strain = float(np.max(per_curve_min))
+    if max_strain <= min_strain:
+        return None
+    return np.linspace(min_strain, max_strain, n_points)
+
+
+def smooth_prediction(y: np.ndarray, window: int = 21, polyorder: int = 3) -> np.ndarray:
+    """使用Savitzky-Golay滤波器平滑预测曲线
+
+    Args:
+        y: 预测值数组
+        window: 滤波窗口大小（必须为奇数）
+        polyorder: 多项式阶数
+
+    Returns:
+        平滑后的预测值
+    """
+    if len(y) < window:
+        window = len(y) // 2 * 2 + 1  # 确保是奇数且小于数据长度
+        if window < 5:
+            return y  # 数据太少，不平滑
+    return savgol_filter(y, window_length=window, polyorder=polyorder)
+
+
+def interpolate_stress_by_condition(
+    model, scaler, material: str, strain_grid: np.ndarray,
+    fixed_param: str, fixed_value: float,
+    vary_param: str, observed_values: list[float], target_value: float
+) -> np.ndarray:
+    """通过线性插值计算中间条件的应力预测
+
+    Args:
+        model: 训练好的GBR模型
+        scaler: 特征归一化器
+        material: 材料名称
+        strain_grid: 应变网格
+        fixed_param: 固定参数名 ('temperature' or 'strain_rate')
+        fixed_value: 固定参数值
+        vary_param: 变化参数名 ('temperature' or 'strain_rate')
+        observed_values: 已观测的变化参数值列表
+        target_value: 目标插值点
+
+    Returns:
+        插值得到的应力预测
+    """
+    # 找到target_value两侧的观测值
+    sorted_vals = sorted(observed_values)
+    lower_val = None
+    upper_val = None
+    for i, v in enumerate(sorted_vals):
+        if v <= target_value:
+            lower_val = v
+        if v >= target_value and upper_val is None:
+            upper_val = v
+            break
+
+    if lower_val is None or upper_val is None or lower_val == upper_val:
+        # 无法插值，退回直接预测
+        return None
+
+    # 计算两个边界条件的应力预测
+    def predict_single(vary_value):
+        if fixed_param == "strain_rate":
+            df = pd.DataFrame({
+                "material": material,
+                "temperature": vary_value,
+                "strain_rate": fixed_value,
+                "strain": strain_grid,
+            })
+        else:
+            df = pd.DataFrame({
+                "material": material,
+                "temperature": fixed_value,
+                "strain_rate": vary_value,
+                "strain": strain_grid,
+            })
+        df = gbr_add_material_features(df)
+        X = gbr_build_features(df)
+        X_s = scaler.transform(X)
+        return model.predict(X_s)
+
+    stress_lower = predict_single(lower_val)
+    stress_upper = predict_single(upper_val)
+
+    # 线性插值
+    t = (target_value - lower_val) / (upper_val - lower_val)
+    stress_interp = stress_lower * (1 - t) + stress_upper * t
+
+    return stress_interp
 
 
 def run_gbr_baseline(base_dir: Path) -> None:
@@ -187,6 +402,111 @@ def run_gbr_baseline(base_dir: Path) -> None:
     all_out = df.copy()
     all_out["stress_pred"] = pred_all
     all_out.to_csv(output_dir / "all_predictions.csv", index=False)
+
+    # ==================== 中值预测（用于外推可视化）====================
+    # 使用线性插值而非直接预测，解决GBR阶梯状预测问题
+    print("\n生成温度/应变率中值预测（线性插值）...")
+    midpoint_predictions = []
+
+    # 各材料用于中值预测的文件模式（只使用完整曲线，排除塑性段强化数据）
+    midpoint_file_patterns = {
+        "al2024": ["fig2"],  # 只用fig2系列，fig8是塑性段强化数据
+        "al2219": ["fig3"],
+        "al7075": ["fig1"],
+        "al6061": None,  # 使用全部数据
+    }
+
+    for material in sorted(df["material"].unique()):
+        df_mat = df[df["material"] == material]
+
+        # 过滤文件模式（用于中值预测的应变网格计算）
+        patterns = midpoint_file_patterns.get(material)
+        if patterns:
+            mask = df_mat["source_file"].str.lower().apply(
+                lambda x: any(p in x.lower() for p in patterns)
+            )
+            df_mat_filtered = df_mat[mask].copy()
+            print(f"  {material}: 中值预测使用 {patterns} 模式 ({len(df_mat_filtered)}/{len(df_mat)} 行)")
+        else:
+            df_mat_filtered = df_mat
+
+        # 对每个应变率都生成温度中值预测
+        all_rates = sorted(df_mat_filtered["strain_rate"].unique())
+        for rate in all_rates:
+            df_rate_group = df_mat_filtered[np.isclose(df_mat_filtered["strain_rate"], rate)]
+            obs_temps = sorted(df_rate_group["temperature"].unique().tolist())
+
+            if len(obs_temps) < 2:
+                continue  # 至少需要2个温度才能计算中值
+
+            mid_temps = build_temperature_midpoints(obs_temps)
+
+            if mid_temps:
+                strain_grid = build_strain_grid(df_rate_group, n_points=200)
+                if strain_grid is not None:
+                    for mid_temp in mid_temps:
+                        # 使用线性插值计算中值温度的应力
+                        stress_pred = interpolate_stress_by_condition(
+                            model, scaler, material, strain_grid,
+                            fixed_param="strain_rate", fixed_value=rate,
+                            vary_param="temperature", observed_values=obs_temps,
+                            target_value=mid_temp
+                        )
+                        if stress_pred is None:
+                            continue
+                        stress_pred = smooth_prediction(stress_pred)  # 平滑处理
+
+                        for i, (s, sp) in enumerate(zip(strain_grid, stress_pred)):
+                            midpoint_predictions.append({
+                                "material": material,
+                                "temperature": mid_temp,
+                                "strain_rate": rate,
+                                "strain": float(s),
+                                "stress_pred": float(sp),
+                                "pred_type": "temp_midpoint",
+                                "observed_temps": str(obs_temps),
+                            })
+                    print(f"  {material}: 温度中值 {mid_temps} @ rate={rate}")
+
+        # 找出该材料覆盖应变率最多的温度（用于应变率中值预测）
+        temp_rate_counts = df_mat_filtered.groupby("temperature")["strain_rate"].nunique()
+        if not temp_rate_counts.empty:
+            best_temp = float(temp_rate_counts.idxmax())
+            df_temp_group = df_mat_filtered[np.isclose(df_mat_filtered["temperature"], best_temp)]
+            obs_rates = sorted(df_temp_group["strain_rate"].unique().tolist())
+            mid_rates = build_rate_midpoints(obs_rates)
+
+            if mid_rates:
+                strain_grid = build_strain_grid(df_temp_group, n_points=200)
+                if strain_grid is not None:
+                    for mid_rate in mid_rates:
+                        # 使用线性插值计算中值应变率的应力
+                        stress_pred = interpolate_stress_by_condition(
+                            model, scaler, material, strain_grid,
+                            fixed_param="temperature", fixed_value=best_temp,
+                            vary_param="strain_rate", observed_values=obs_rates,
+                            target_value=mid_rate
+                        )
+                        if stress_pred is None:
+                            continue
+                        stress_pred = smooth_prediction(stress_pred)  # 平滑处理
+
+                        for i, (s, sp) in enumerate(zip(strain_grid, stress_pred)):
+                            midpoint_predictions.append({
+                                "material": material,
+                                "temperature": best_temp,
+                                "strain_rate": mid_rate,
+                                "strain": float(s),
+                                "stress_pred": float(sp),
+                                "pred_type": "rate_midpoint",
+                                "observed_rates": str(obs_rates),
+                            })
+                    print(f"  {material}: 应变率中值 {mid_rates} @ temp={best_temp}")
+
+    if midpoint_predictions:
+        midpoint_df = pd.DataFrame(midpoint_predictions)
+        midpoint_df.to_csv(output_dir / "midpoint_predictions.csv", index=False)
+        print(f"  保存中值预测: {len(midpoint_predictions)} 条记录")
 
     print("GBR baseline done")
     print("overall test:", metrics["test"])
