@@ -90,6 +90,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==================== PINN 模型定义 ====================
 class StressPINN(nn.Module):
+    """软约束PINN模型（标准版本）"""
     def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float = 0.1):
         super().__init__()
         layers = []
@@ -105,7 +106,7 @@ class StressPINN(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, x_raw=None, E_MPa=None):
         return self.network(x)
 
 
@@ -143,7 +144,7 @@ def load_pinn_model(model_path: str):
 
 
 def predict_stress(model, scaler_X, scaler_y, strain, temperature, strain_rate, material):
-    """使用 PINN 模型预测应力（21维特征）"""
+    """使用 PINN 模型预测应力（21维特征，包含material_id）"""
     mat_feat = MATERIAL_FEATURES[material]
     log_strain_rate = np.log10(max(strain_rate, 1e-12))
 

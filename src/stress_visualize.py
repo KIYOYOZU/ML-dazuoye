@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import shutil
+import joblib
 from matplotlib import colormaps
 from matplotlib.colors import Normalize
 
@@ -19,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parents[1]
 CONFIG = {
     "gbr_predictions": str(BASE_DIR / "results" / "baseline_gbr" / "all_predictions.csv"),
     "midpoint_predictions": str(BASE_DIR / "results" / "baseline_gbr" / "midpoint_predictions.csv"),
+    "gbr_model": str(BASE_DIR / "results" / "baseline_gbr" / "gbr_model.pkl"),
     "output_dir": str(BASE_DIR / "results" / "figures"),
     "clear_output_dir": True,
 }
