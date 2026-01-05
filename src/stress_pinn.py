@@ -56,8 +56,8 @@ CONFIG = {
         "al6061": 3.0,  # 数据最少，给最高权重
         "al7075": 1.5,
     },
-    # 边界条件约束（使用collocation points方式）
-    "lambda_boundary": 0.0,  # 禁用原始边界约束
+    # 边界条件约束
+    "lambda_boundary": 0.0,  # 禁用边界约束，使用collocation points代替
     "boundary_strain_threshold": 0.002,
     # 零应变collocation points配置
     "use_collocation_points": True,  # 启用collocation points
@@ -103,7 +103,7 @@ MATERIAL_FEATURES = {
 COMPOSITION_COLS = ["Si_wt", "Fe_wt", "Cu_wt", "Mn_wt", "Mg_wt",
                    "Cr_wt", "Zn_wt", "Ti_wt", "Zr_wt", "V_wt", "Al_wt"]
 
-# 特征列（共21维）
+# 特征列（共21维，包含material_id）
 FEATURE_COLS = ["strain", "temperature", "log_strain_rate", "material_id",
                 "E_GPa", "c1", "c2", "c3", "c4", "c5"] + COMPOSITION_COLS
 
@@ -293,11 +293,16 @@ def create_dataloaders(df, train_files, val_files, test_files, scaler_X, scaler_
     train_loader = DataLoader(train_dataset, batch_size=CONFIG["batch_size"], shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=CONFIG["batch_size"], shuffle=False)
 
-    return train_loader, val_loader, (X_test_s, y_test, test_df)
+    # 测试集原始特征和E值（用于硬约束模式评估）
+    X_test = build_features(test_df)
+    E_test = test_df["E_GPa"].values.astype(np.float32).reshape(-1, 1) * 1000
+
+    return train_loader, val_loader, (X_test_s, y_test, test_df, X_test, E_test)
 
 
 # ==================== PINN 模型 ====================
 class StressPINN(nn.Module):
+    """软约束PINN模型（标准版本）"""
     def __init__(self, input_dim: int, hidden_dims: list[int], dropout: float = 0.1):
         super().__init__()
         layers = []
@@ -313,7 +318,8 @@ class StressPINN(nn.Module):
         layers.append(nn.Linear(prev_dim, 1))
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, x_raw=None, E_MPa=None):
+        # 忽略x_raw和E_MPa，保持兼容性
         return self.network(x)
 
 
@@ -388,7 +394,8 @@ class PhysicsLoss:
 
 
 # ==================== 训练 ====================
-def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
+def train_epoch(model, train_loader, optimizer, criterion, physics_loss, scaler_y):
+    """训练一个epoch（软约束模式）"""
     model.train()
     total_loss = 0
     loss_components = {"data": 0, "mono": 0, "elastic": 0, "temp": 0, "rate": 0, "boundary": 0}
@@ -435,6 +442,7 @@ def train_epoch(model, train_loader, optimizer, criterion, physics_loss):
 
 
 def validate(model, val_loader, criterion, physics_loss):
+    """验证（软约束模式）"""
     model.eval()
     total_loss = 0
     with torch.no_grad():
@@ -447,7 +455,8 @@ def validate(model, val_loader, criterion, physics_loss):
     return total_loss / len(val_loader)
 
 
-def evaluate(model, X_test_s, y_test, scaler_y):
+def evaluate(model, X_test_s, y_test, scaler_y, X_test_raw=None, E_test=None):
+    """评估（软约束模式）"""
     model.eval()
     with torch.no_grad():
         X_tensor = torch.from_numpy(X_test_s.astype(np.float32)).to(DEVICE)
@@ -465,7 +474,7 @@ def evaluate(model, X_test_s, y_test, scaler_y):
 # ==================== 主函数 ====================
 def main():
     print("=" * 60)
-    print("PINN 应力应变预测训练 (21维特征)")
+    print("PINN 应力应变预测训练 (软约束模式, 21维特征, 启用边界约束)")
     print(f"设备: {DEVICE}")
     print("=" * 60)
 
@@ -480,14 +489,14 @@ def main():
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
 
-    train_loader, val_loader, (X_test_s, y_test, test_df) = create_dataloaders(
+    train_loader, val_loader, (X_test_s, y_test, test_df, X_test_raw, E_test) = create_dataloaders(
         df, train_files, val_files, test_files, scaler_X, scaler_y
     )
     print(f"  训练样本: {len(train_loader.dataset)}, 验证样本: {len(val_loader.dataset)}")
     print(f"  特征维度: {len(FEATURE_COLS)}")
 
     print("\n[2] 创建模型...")
-    input_dim = len(FEATURE_COLS)  # 21维
+    input_dim = len(FEATURE_COLS)
     model = StressPINN(
         input_dim=input_dim,
         hidden_dims=CONFIG["hidden_dims"],
@@ -509,7 +518,7 @@ def main():
     history = {"train_loss": [], "val_loss": [], "components": []}
 
     for epoch in range(CONFIG["epochs"]):
-        train_loss, loss_comp = train_epoch(model, train_loader, optimizer, criterion, physics_loss)
+        train_loss, loss_comp = train_epoch(model, train_loader, optimizer, criterion, physics_loss, scaler_y)
         val_loss = validate(model, val_loader, criterion, physics_loss)
         scheduler.step()
 

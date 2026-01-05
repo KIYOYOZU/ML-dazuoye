@@ -186,7 +186,7 @@ def gbr_build_features(df: pd.DataFrame) -> pd.DataFrame:
         "strain",
         "temperature",
         "log_strain_rate",
-        "material_id",
+        # 去掉 material_id，使用物理特征和元素成分来泛化到新材料
         "E_GPa",
         "c1",
         "c2",
